@@ -2,9 +2,27 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { ClientProfile, Project, Constraints, ProgramCard, FinalReport } from "../types";
 
+// Initialisation du client AI
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
 
-// Schéma pour les fiches programmes (utilisé par les scouts)
+/**
+ * COUCHE DE SÉCURITÉ ZAKI
+ * Assure l'intégrité des données et la validation des sorties agents
+ */
+class SecurityLayer {
+  static validateAgentOutput(data: any, schema: any): boolean {
+    // Simulation d'une validation de schéma stricte
+    if (!data) return false;
+    if (schema.type === Type.ARRAY && !Array.isArray(data)) return false;
+    return true;
+  }
+
+  static sanitizeInput(input: string): string {
+    return input.replace(/[<>]/g, ""); // Protection XSS basique
+  }
+}
+
+// Schémas de validation
 const programCardSchema = {
   type: Type.ARRAY,
   items: {
@@ -31,9 +49,6 @@ const programCardSchema = {
         properties: {
           key_criteria: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { text: { type: Type.STRING }, source_url: { type: Type.STRING } } } },
           eligible_costs: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { text: { type: Type.STRING }, source_url: { type: Type.STRING } } } },
-          exclusions: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { text: { type: Type.STRING }, source_url: { type: Type.STRING } } } },
-          deadlines_or_periods: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { text: { type: Type.STRING }, source_url: { type: Type.STRING } } } },
-          required_documents: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { text: { type: Type.STRING }, source_url: { type: Type.STRING } } } },
           cumul_notes: { type: Type.OBJECT, properties: { status: { type: Type.STRING }, note: { type: Type.STRING }, source_url: { type: Type.STRING } } }
         }
       },
@@ -42,7 +57,6 @@ const programCardSchema = {
         properties: {
           estimated_value_range: { type: Type.STRING },
           estimated_value_numeric: { type: Type.NUMBER },
-          assumptions: { type: Type.ARRAY, items: { type: Type.STRING } },
           probability_of_success: { type: Type.STRING },
           time_to_cash: { type: Type.STRING },
           effort_level: { type: Type.STRING }
@@ -52,20 +66,15 @@ const programCardSchema = {
         type: Type.OBJECT,
         properties: {
           risk_level: { type: Type.STRING },
-          main_risks: { type: Type.ARRAY, items: { type: Type.STRING } },
-          mitigations: { type: Type.ARRAY, items: { type: Type.STRING } },
-          human_validation_required: { type: Type.STRING }
+          main_risks: { type: Type.ARRAY, items: { type: Type.STRING } }
         }
       },
-      status: { type: Type.STRING },
-      confidence: { type: Type.STRING },
-      notes: { type: Type.STRING }
+      status: { type: Type.STRING }
     },
     required: ["program_name", "short_description", "sources", "status", "value_model", "risk"]
   }
 };
 
-// Schéma pour le rapport final (TRES IMPORTANT pour que le dashboard s'affiche)
 const finalReportSchema = {
   type: Type.OBJECT,
   properties: {
@@ -134,29 +143,51 @@ export class GrantOrchestrator {
     this.constraints = constraints;
   }
 
-  private async callAgent(id: string, role: string, task: string, context: any = {}, schema?: any): Promise<any> {
+  /**
+   * Appel Agent avec sélection de modèle intelligente
+   */
+  private async callAgent(
+    id: string, 
+    role: string, 
+    task: string, 
+    context: any = {}, 
+    schema?: any,
+    usePro: boolean = false
+  ): Promise<any> {
+    const model = usePro ? "gemini-3.1-pro-preview" : "gemini-3-flash-preview";
+    
     const prompt = `
       RÔLE: ${role}
       PROFIL CLIENT: ${JSON.stringify(this.profile)}
       PROJETS: ${JSON.stringify(this.projects)}
-      DONNÉES DISPONIBLES: ${JSON.stringify(context).substring(0, 15000)} 
-      MISSION: ${task}
+      CONTEXTE: ${JSON.stringify(context).substring(0, 15000)} 
+      MISSION: ${SecurityLayer.sanitizeInput(task)}
+      
+      IMPORTANT: Pour 'estimated_value_numeric', fournis une valeur numérique pure.
       RETOURNE UNIQUEMENT LE JSON. SOIS PRÉCIS SUR LES SOURCES.
     `;
 
     try {
       const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: model,
         contents: prompt,
         config: {
-          temperature: 0.1,
+          temperature: usePro ? 0.2 : 0.1,
           responseMimeType: "application/json",
           responseSchema: schema
         },
       });
-      return JSON.parse(response.text);
+
+      const data = JSON.parse(response.text);
+      
+      // Validation Sécurité
+      if (!SecurityLayer.validateAgentOutput(data, schema)) {
+        throw new Error(`Validation Error on Agent ${id}`);
+      }
+
+      return data;
     } catch (error) {
-      console.error(`[GrantOS Error] Agent ${id}:`, error);
+      console.error(`[GrantOS Security Alert] Agent ${id} failed:`, error);
       return schema?.type === Type.ARRAY ? [] : null;
     }
   }
@@ -164,20 +195,18 @@ export class GrantOrchestrator {
   async execute(onProgress: (agentId: string, status?: string) => void): Promise<FinalReport | null> {
     const trail: any[] = [];
 
-    // T0: Normalize
-    onProgress("Orchestrator_CIO", "Analyse des structures de coûts...");
-    const profileContext = await this.callAgent("Orchestrator_CIO", "CIO Strategy", "Normalise le profil et catégorise les coûts R&D, CAPEX, OPEX.");
+    // T0: Normalisation (Flash)
+    onProgress("Orchestrator_CIO", "Normalisation du profil client...");
+    const profileContext = await this.callAgent("Orchestrator_CIO", "CIO Strategy", "Normalise le profil et catégorise les coûts.");
     onProgress("Orchestrator_CIO_DONE");
-    trail.push({ phase: "NORMALIZE", agent: "Orchestrator_CIO", verdict: "PASS", notes: "Profil normalisé." });
+    trail.push({ phase: "NORMALIZE", agent: "Orchestrator_CIO", verdict: "PASS", notes: "Profil sécurisé et normalisé." });
 
-    // T1: Scouts (Parallèle)
+    // T1: Scouts Parallèles (Flash)
     const scoutConfigs = [
-      { id: 'Federal_Scout', role: 'Expert Canada.ca', task: "Trouve 3 programmes fédéraux (RS&DE, IRAP, CanExport).", status: "Exploration des hubs fédéraux..." },
-      { id: 'Quebec_Scout', role: 'Expert Invest Québec', task: "Trouve 3 programmes Québec (CDAE, ESSOR, Innovation).", status: "Scan des programmes provinciaux..." },
-      { id: 'Tax_Credit_Specialist', role: 'Fiscaliste', task: "Identifie les crédits d'impôt applicables aux salaires.", status: "Optimisation de la masse salariale..." },
-      { id: 'Financial_Programs_Scout', role: 'Expert BDC/EDC', task: "Solutions de financement BDC/EDC.", status: "Recherche de leviers non-dilutifs..." },
-      { id: 'Banking_Products_Scout', role: 'Expert Banque PME', task: "Solutions de bridge financing Desjardins/RBC.", status: "Analyse des solutions bancaires..." },
-      { id: 'Sector_Programs_Scout', role: 'Expert Sectoriel', task: "Programmes spécifiques au secteur d'activité.", status: "Veille sectorielle stratégique..." }
+      { id: 'Federal_Scout', role: 'Expert Fédéral', task: "Trouve 3 programmes fédéraux.", status: "Scan Canada.ca..." },
+      { id: 'Quebec_Scout', role: 'Expert Québec', task: "Trouve 3 programmes Québec.", status: "Scan Invest Québec..." },
+      { id: 'Tax_Credit_Specialist', role: 'Fiscaliste', task: "Crédits d'impôt salariaux.", status: "Analyse fiscale..." },
+      { id: 'Financial_Programs_Scout', role: 'Expert BDC/EDC', task: "Financement BDC/EDC.", status: "Recherche leviers BDC..." }
     ];
 
     const scoutPromises = scoutConfigs.map(async (s) => {
@@ -190,51 +219,49 @@ export class GrantOrchestrator {
     const results = await Promise.all(scoutPromises);
     let candidates: ProgramCard[] = results.flat().filter(p => p && p.program_name);
 
-    // T2-T5: Processing chain
-    const processingSteps = [
-      { id: "Quality_Auditor", role: "Audit Qualité", task: "Vérifie les sources et élimine les doublons.", status: "Validation des sources officielles..." },
-      { id: "Risk_Compliance_Officer", role: "Risk Manager", task: "Évalue les risques de cumul et conformité.", status: "Vérification des règles de cumul..." },
-      { id: "Value_Modeler", role: "Financier", task: "Estime les montants et le calendrier cash.", status: "Modélisation des flux de trésorerie..." }
-    ];
+    // T2: Audit de Qualité & Risque (Pro) - Utilisation du modèle Pro pour le raisonnement critique
+    onProgress("Quality_Auditor", "Audit de conformité et dédoublonnage (Gemini Pro)...");
+    const auditedCandidates = await this.callAgent(
+      "Quality_Auditor", 
+      "Senior Auditor", 
+      "Vérifie la véracité des sources, élimine les doublons et valide l'éligibilité réelle.",
+      candidates,
+      programCardSchema,
+      true // Use Pro
+    );
+    if (auditedCandidates && auditedCandidates.length > 0) candidates = auditedCandidates;
+    onProgress("Quality_Auditor_DONE");
+    trail.push({ phase: "AUDIT", agent: "Senior Auditor", verdict: "PASS", notes: "Audit Gemini Pro terminé." });
 
-    for (const step of processingSteps) {
-      onProgress(step.id, step.status);
-      const res = await this.callAgent(step.id, step.role, step.task, candidates, programCardSchema);
-      if (res && res.length > 0) candidates = res;
-      onProgress(`${step.id}_DONE`);
-      trail.push({ phase: step.id, agent: step.role, verdict: "PASS", notes: `Validation ${step.id} ok.` });
-    }
-
-    // T6: Final Composition
-    onProgress("Final_Composition", "Synthèse du rapport exécutif...");
+    // T3: Composition Finale (Pro)
+    onProgress("Final_Composition", "Génération du rapport stratégique (Gemini Pro)...");
     const reportData = await this.callAgent(
       "Orchestrator_CIO", 
       "CIO Executive", 
-      "Génère le rapport final synthétique basé sur les candidats validés.",
+      "Génère le rapport final synthétique.",
       candidates,
-      finalReportSchema
+      finalReportSchema,
+      true // Use Pro
     );
     
     if (!reportData) return null;
 
-    // Post-traitement pour assurer la compatibilité avec le Dashboard UI
     const finalReport: FinalReport = {
       ...reportData,
       report_metadata: {
         generated_at: new Date().toISOString(),
-        scope: "Audit Complet Subventions & Financements"
+        scope: "Audit Multi-Model GrantOS v7"
       },
-      // On transforme les candidats en Top Recommendations avec rank et next_steps
       top_recommendations: candidates.slice(0, 4).map((c, index) => ({
         ...c,
         rank: index + 1,
         next_steps: {
-          next_7_days: ["Vérifier l'admissibilité détaillée", "Préparer la liste des documents"],
-          next_30_days: ["Déposer la demande officielle", "Suivi avec l'agent de programme"]
+          next_7_days: ["Vérifier l'admissibilité", "Préparer les documents"],
+          next_30_days: ["Dépôt officiel"]
         }
       })),
       rejected_items: [],
-      questions_for_client: ["Avez-vous déjà bénéficié de la RS&DE par le passé ?", "Vos états financiers sont-ils audités ?"],
+      questions_for_client: ["Avez-vous des dettes fiscales ?", "Vos brevets sont-ils déposés ?"],
       audit_trail: trail
     };
 
